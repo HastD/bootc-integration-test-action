@@ -1,18 +1,18 @@
-name: %%IMAGE%%
+name: "%%IMAGE%%"
 
 description: "Integration testing"
 
-base-image: %%REGISTRY%%/%%IMAGE%%
+base-image: "%%REGISTRY%%/%%IMAGE%%"
 
 image-version: latest
 
-alt-tags: 
-  - integrationtest-%%TESTUUID%%
+alt-tags:
+  - "integrationtest-%%TESTUUID%%"
 
 modules:
   - type: files
     files:
-      - source: system  
+      - source: system
         destination: /
   - type: script
     scripts:
