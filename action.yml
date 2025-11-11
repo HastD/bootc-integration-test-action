@@ -82,6 +82,12 @@ runs:
       run: |
         sudo apt update
         sudo apt install -y passt qemu-system-x86 libvirt-daemon-system libvirt-clients virtinst podman apparmor-utils wget libguestfs-tools
+        # libvirt-ssh-proxy is only available starting with Ubuntu 25.04, so we
+        # switch to using the package repos for that release.
+        sudo cp /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/00-plucky.sources
+        sudo sed -i -e 's/\<noble/plucky/g' /etc/apt/sources.list.d/00-plucky.sources
+        sudo apt update
+        sudo apt install -y libvirt-ssh-proxy
 
     - name: Install BlueBuild
       shell: bash
@@ -191,6 +197,7 @@ runs:
           --os-variant="silverblue-unknown" \
           --disk="size=${DISK_SIZE_GB},backing_store=${DISK_IMAGE_PATH}" \
           --serial="file,path=${BOOT_LOG_PATH}" \
+          --vsock='cid.auto=yes' \
           --network network=default \
           --noautoconsole
 
@@ -206,6 +213,7 @@ runs:
     - name: 'Run Tests'
       shell: bash
       env:
+        VM_NAME: ${{ inputs.vm-name }}
         TESTS: ${{ inputs.tests }}
         DATA_FILES: ${{ inputs.data-files }}
       run: |
@@ -219,23 +227,11 @@ runs:
         readarray -t TEST_LIST < <(echo "$TESTS" | sed '/^[[:space:]]*$/d')
         readarray -t DATA_FILE_LIST < <(echo "${DATA_FILES:-}" | sed '/^[[:space:]]*$/d')
 
-        VM_IP="192.168.122.2"
-        echo "Waiting for SSH port to be open on ${VM_IP}..."
-        for i in {1..30}; do
-          if nc -z "${VM_IP}" 22; then
-            break
-          elif (( i == 30 )); then
-            echo "SSH port on ${VM_IP} is not open after 30 attempts. Giving up."
-            exit 1
-          fi
-          sleep 5
-        done
-        echo "SSH port is open on ${VM_IP}."
-
         SSH_OPTS=(-o ConnectTimeout=20 -o StrictHostKeyChecking=no -i '~/.ssh/id_ed25519')
 
+        ssh "${SSH_OPTS[@]}" "core@qemu/${VM_NAME}" "ls -alh /var/home"
         echo 'Copying files to VM...'
-        scp "${SSH_OPTS[@]}" "${TEST_LIST[@]}" "${DATA_FILE_LIST[@]}" core@"$VM_IP":/home/core/
+        scp "${SSH_OPTS[@]}" "${TEST_LIST[@]}" "${DATA_FILE_LIST[@]}" "core@qemu/${VM_NAME}:/home/core/"
         echo 'Done copying files to VM.'
 
         FAILED_TESTS=0
@@ -246,7 +242,7 @@ runs:
           LOG_FILE="test-logs/${BASENAME}.log"
 
           set +e
-          ssh "${SSH_OPTS[@]}" core@"$VM_IP" "chmod +x $REMOTE_PATH && $REMOTE_PATH" > "$LOG_FILE" 2>&1
+          ssh "${SSH_OPTS[@]}" "core@qemu/${VM_NAME}" "chmod +x $REMOTE_PATH && $REMOTE_PATH" > "$LOG_FILE" 2>&1
           TEST_EXIT_CODE=$?
           set -e
 
