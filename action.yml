@@ -1,14 +1,6 @@
-# Copyright 2025 The Secureblue Authors
+# SPDX-FileCopyrightText: (c) 2025-2026 The Secureblue Authors
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software distributed under the License is
-# distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 
 name: 'bootc-integration-test-action'
 description: 'This action runs integration tests against any bootable container image.'
@@ -60,7 +52,7 @@ runs:
         echo 'set man-db/auto-update false' | sudo debconf-communicate
         sudo dpkg-reconfigure man-db
         sudo rm -f /var/lib/man-db/auto-update
-        sudo sed -i -e 's/^update_initramfs=.*/update_initramfs=no/' /etc/initramfs-tools/update-initramfs.conf
+        echo 'update_initramfs=no' | sudo tee /etc/initramfs-tools/update-initramfs.conf >/dev/null
 
     - name: Free disk space
       uses: hastd/free-disk-space@68572aeaadb7f76bd408246328e95926323402b5 # v0.1.2
@@ -131,9 +123,11 @@ runs:
 
         TESTUUID=$(uuidgen)
 
-        sed -i --sandbox -e "s|%%IMAGE%%|${IMAGE}|g" "${RECIPE_PATH}"
-        sed -i --sandbox -e "s|%%REGISTRY%%|${REGISTRY}|g" "${RECIPE_PATH}"
-        sed -i --sandbox -e "s|%%TESTUUID%%|${TESTUUID}|g" "${RECIPE_PATH}"
+        sed -i --sandbox \
+          -e "s|%%IMAGE%%|${IMAGE}|g" \
+          -e "s|%%REGISTRY%%|${REGISTRY,,}|g" \
+          -e "s|%%TESTUUID%%|${TESTUUID}|g" \
+          "${RECIPE_PATH}"
 
         BUILD_OPTS="--build-driver podman --push --squash"
         bluebuild build -v ${BUILD_OPTS} "${RECIPE_PATH}"
@@ -147,13 +141,18 @@ runs:
         REGISTRY: ${{ inputs.registry }}
         INTEGRATION_TEST_TAG: ${{ steps.build_test_image.outputs.integration_test_tag }}
       run: |
-        INTEGRATION_TEST_IMAGE="${REGISTRY}/${IMAGE}:${INTEGRATION_TEST_TAG}"
-        sudo podman pull "$INTEGRATION_TEST_IMAGE"
+        INTEGRATION_TEST_IMAGE="${REGISTRY,,}/${IMAGE}:${INTEGRATION_TEST_TAG}"
+        sudo podman pull "${INTEGRATION_TEST_IMAGE}"
         mkdir output
 
         PUBKEY=$(cat ~/.ssh/id_ed25519.pub)
         mv "./bootc-integration-test-action/config.toml" .
         sed -i --sandbox -e "s|%%PUBKEY%%|${PUBKEY}|g" ./config.toml
+
+        # This bwrap profile breaks bootc-image-builder, so temporarily disable it:
+        trap 'sudo aa-enforce unpriv_bwrap' EXIT
+        sudo aa-disable unpriv_bwrap
+
         sudo podman run \
             --rm \
             -it \
@@ -168,7 +167,7 @@ runs:
             --use-librepo=True \
             --rootfs btrfs \
             --progress verbose \
-            "$INTEGRATION_TEST_IMAGE"
+            "${INTEGRATION_TEST_IMAGE}"
 
         sudo mv output/qcow2/disk.qcow2 /var/lib/libvirt/images/
 
