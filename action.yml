@@ -75,7 +75,9 @@ runs:
       shell: bash
       run: |
         sudo apt update
-        sudo apt install -y passt qemu-system-x86 libvirt-daemon-system libvirt-clients virtinst podman apparmor-utils wget libguestfs-tools
+        sudo apt install -y \
+          apparmor-utils libguestfs-tools libvirt-clients libvirt-daemon-system \
+          libvirt-ssh-proxy passt podman qemu-system-x86 virtinst wget
 
     - name: Install BlueBuild
       shell: bash
@@ -94,7 +96,7 @@ runs:
         echo 'owner "/var/lib/libvirt/boot/**" r,' | sudo tee -a /etc/apparmor.d/abstractions/libvirt-qemu
         sudo apparmor_parser -r /etc/apparmor.d/usr.sbin.libvirtd
         sudo systemctl restart libvirtd
-        sudo usermod -aG kvm,libvirt "$USER"
+        sudo usermod -aG kvm,libvirt "${USER}"
 
     - name: Generate SSH Keypair
       shell: bash
@@ -116,38 +118,33 @@ runs:
         BB_PASSWORD: ${{ inputs.token }}
       run: |
         cd ./bootc-integration-test-action
-        RECIPE_PATH=./recipe.yml
-
+        recipe_path=./recipe.yml
         cosign generate-key-pair
-        COSIGN_PRIVATE_KEY=$(< cosign.key)
-
-        TESTUUID=$(uuidgen)
-
+        testuuid=$(uuidgen)
         sed -i --sandbox \
           -e "s|%%IMAGE%%|${IMAGE}|g" \
           -e "s|%%REGISTRY%%|${REGISTRY,,}|g" \
-          -e "s|%%TESTUUID%%|${TESTUUID}|g" \
-          "${RECIPE_PATH}"
+          -e "s|%%TESTUUID%%|${testuuid}|g" \
+          "${recipe_path}"
 
-        BUILD_OPTS="--build-driver podman --push --squash"
-        bluebuild build -v ${BUILD_OPTS} "${RECIPE_PATH}"
-        INTEGRATION_TEST_TAG="integrationtest-${TESTUUID}"
-        echo "integration_test_tag=${INTEGRATION_TEST_TAG}" >> "${GITHUB_OUTPUT}"
+        bluebuild build -v --build-driver podman --push --squash "${recipe_path}"
+        integration_test_tag="integrationtest-${testuuid}"
+        echo "integration_test_tag=${integration_test_tag}" >> "${GITHUB_OUTPUT}"
 
-    - name: 'Create VM disk image'
+    - name: Create VM disk image
       shell: bash
       env:
         IMAGE: ${{ inputs.image }}
         REGISTRY: ${{ inputs.registry }}
         INTEGRATION_TEST_TAG: ${{ steps.build_test_image.outputs.integration_test_tag }}
       run: |
-        INTEGRATION_TEST_IMAGE="${REGISTRY,,}/${IMAGE}:${INTEGRATION_TEST_TAG}"
-        sudo podman pull "${INTEGRATION_TEST_IMAGE}"
+        integration_test_image="${REGISTRY,,}/${IMAGE}:${INTEGRATION_TEST_TAG}"
+        sudo podman pull "${integration_test_image}"
         mkdir output
 
-        PUBKEY=$(cat ~/.ssh/id_ed25519.pub)
+        pubkey="$(< ~/.ssh/id_ed25519.pub)"
         mv "./bootc-integration-test-action/config.toml" .
-        sed -i --sandbox -e "s|%%PUBKEY%%|${PUBKEY}|g" ./config.toml
+        sed -i --sandbox -e "s|%%PUBKEY%%|${pubkey}|g" ./config.toml
 
         # This bwrap profile breaks bootc-image-builder, so temporarily disable it:
         trap 'sudo aa-enforce unpriv_bwrap' EXIT
@@ -167,11 +164,11 @@ runs:
             --use-librepo=True \
             --rootfs btrfs \
             --progress verbose \
-            "${INTEGRATION_TEST_IMAGE}"
+            "${integration_test_image}"
 
         sudo mv output/qcow2/disk.qcow2 /var/lib/libvirt/images/
 
-    - name: 'Install and start VM'
+    - name: Install and start VM
       shell: bash
       env:
         DISK_SIZE_GB: ${{ inputs.disk-size-gb }}
@@ -179,23 +176,24 @@ runs:
         VCPU: ${{ inputs.vcpus }}
         MEMORY_MB: ${{ inputs.memory-mb }}
       run: |
-        DISK_IMAGE_PATH="/var/lib/libvirt/images/disk.qcow2"
+        disk_image_path='/var/lib/libvirt/images/disk.qcow2'
         mkdir test-logs
-        BOOT_LOG_PATH="$(realpath test-logs)/boot.log"
+        boot_log_path="$(realpath test-logs)/boot.log"
         sudo virt-install \
-          --connect="qemu:///system" \
+          --connect='qemu:///system' \
           --name="${VM_NAME}" \
           --vcpus="${VCPU}" \
           --memory="${MEMORY_MB}" \
           --import \
           --graphics=none \
-          --os-variant="silverblue-unknown" \
-          --disk="size=${DISK_SIZE_GB},backing_store=${DISK_IMAGE_PATH}" \
-          --serial="file,path=${BOOT_LOG_PATH}" \
+          --os-variant='silverblue-unknown' \
+          --disk="size=${DISK_SIZE_GB},backing_store=${disk_image_path}" \
+          --serial="file,path=${boot_log_path}" \
+          --vsock='cid.auto=yes' \
           --network network=default \
           --noautoconsole
 
-    - name: 'Wait for VM Startup'
+    - name: Wait for VM startup
       if: ${{ inputs.startup-wait-seconds > 0 }}
       env:
         STARTUP_WAIT_SECONDS: ${{ inputs.startup-wait-seconds }}
@@ -204,60 +202,51 @@ runs:
         echo "Waiting ${STARTUP_WAIT_SECONDS} seconds for the VM to start..."
         sleep "${STARTUP_WAIT_SECONDS}"
 
-    - name: 'Run Tests'
+    - name: Run tests
       shell: bash
       env:
         TESTS: ${{ inputs.tests }}
         DATA_FILES: ${{ inputs.data-files }}
+        VM_NAME: ${{ inputs.vm-name }}
       run: |
         echo "Running tests..."
 
-        if [[ -z "$TESTS" ]]; then
+        if [[ -z "${TESTS}" ]]; then
           echo "Tests missing..."
           exit 1
         fi
 
-        readarray -t TEST_LIST < <(echo "$TESTS" | sed '/^[[:space:]]*$/d')
-        readarray -t DATA_FILE_LIST < <(echo "${DATA_FILES:-}" | sed '/^[[:space:]]*$/d')
+        readarray -t TEST_LIST < <(echo "${TESTS}" | sed '/^[[:blank:]]*$/d')
+        readarray -t DATA_FILE_LIST < <(echo "${DATA_FILES:-}" | sed '/^[[:blank:]]*$/d')
 
-        VM_IP="192.168.122.2"
-        echo "Waiting for SSH port to be open on ${VM_IP}..."
-        for i in {1..30}; do
-          if nc -z "${VM_IP}" 22; then
-            break
-          elif (( i == 30 )); then
-            echo "SSH port on ${VM_IP} is not open after 30 attempts. Giving up."
-            exit 1
-          fi
-          sleep 5
-        done
-        echo "SSH port is open on ${VM_IP}."
-
-        SSH_OPTS=(-o ConnectTimeout=20 -o StrictHostKeyChecking=no -i '~/.ssh/id_ed25519')
+        vm_address="qemu/${VM_NAME}"
+        ssh_opts=(-o ConnectTimeout=20 -o StrictHostKeyChecking=no -i '~/.ssh/id_ed25519')
 
         echo 'Copying files to VM...'
-        scp "${SSH_OPTS[@]}" "${TEST_LIST[@]}" "${DATA_FILE_LIST[@]}" core@"$VM_IP":/home/core/
+        scp "${ssh_opts[@]}" -- \
+          "${TEST_LIST[@]}" "${DATA_FILE_LIST[@]}" "core@${vm_address}:/home/core/"
         echo 'Done copying files to VM.'
 
-        FAILED_TESTS=0
-        for TEST_FILE in "${TEST_LIST[@]}"; do
-          echo "Running test: $TEST_FILE"
-          BASENAME="${TEST_FILE##*/}"
-          REMOTE_PATH="/home/core/${BASENAME}"
-          LOG_FILE="test-logs/${BASENAME}.log"
+        failed_tests=0
+        for test_file in "${TEST_LIST[@]}"; do
+          echo "Running test: ${test_file}"
+          basename="${test_file##*/}"
+          remote_path="/home/core/${basename}"
+          log_file="test-logs/${basename}.log"
 
           set +e
-          ssh "${SSH_OPTS[@]}" core@"$VM_IP" "chmod +x $REMOTE_PATH && $REMOTE_PATH" > "$LOG_FILE" 2>&1
-          TEST_EXIT_CODE=$?
+          ssh "${ssh_opts[@]}" "core@${vm_address}" \
+            "chmod +x '${remote_path}' && '${remote_path}'" > "${log_file}" 2>&1
+          test_exit_code="$?"
           set -e
 
-          if (( TEST_EXIT_CODE != 0 )); then
-            echo "Test $TEST_FILE failed"
-            (( ++FAILED_TESTS ))
+          if (( test_exit_code != 0 )); then
+            echo "Test ${test_file} failed"
+            (( ++failed_tests ))
           fi
         done
 
-        if (( FAILED_TESTS > 0 )); then
+        if (( failed_tests > 0 )); then
           exit 1
         fi
 
@@ -275,7 +264,7 @@ runs:
       run: |
         sudo chmod -R a+r test-logs
 
-    - name: Upload Test Logs
+    - name: Upload test logs
       if: always()
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
